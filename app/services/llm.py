@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -95,39 +96,45 @@ def _filter_think(delta: str, state: dict) -> str | None:
 
 async def stream_chat(messages: list[dict]):
     think_state: dict = {}
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT)) as client:
-            model = await _resolve_model(client)
-            async with client.stream(
-                "POST",
-                f"{VLLM_BASE_URL}/chat/completions",
-                json={"model": model, "messages": messages, "stream": True},
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        yield "data: [DONE]\n\n"
-                        return
-                    try:
-                        event = json.loads(data)
-                        choices = event.get("choices", [])
-                        if not choices:
+    last_exc = None
+    for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(2)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT)) as client:
+                model = await _resolve_model(client)
+                async with client.stream(
+                    "POST",
+                    f"{VLLM_BASE_URL}/chat/completions",
+                    json={"model": model, "messages": messages, "stream": True},
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data: "):
                             continue
-                        delta = choices[0].get("delta", {}).get("content")
-                        if not delta:
+                        data = line[6:]
+                        if data == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            return
+                        try:
+                            event = json.loads(data)
+                            choices = event.get("choices", [])
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta", {}).get("content")
+                            if not delta:
+                                continue
+                            filtered = _filter_think(delta, think_state)
+                            if filtered is not None:
+                                yield f"data: {json.dumps(filtered)}\n\n"
+                        except json.JSONDecodeError:
                             continue
-                        filtered = _filter_think(delta, think_state)
-                        if filtered is not None:
-                            yield f"data: {json.dumps(filtered)}\n\n"
-                    except json.JSONDecodeError:
-                        continue
-    except httpx.HTTPError as exc:
-        msg = f"Error: could not reach the model service ({exc.__class__.__name__})."
-        yield f"data: {json.dumps(msg)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+            yield "data: [DONE]\n\n"
+            return
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            logger.warning("stream_chat attempt %d failed: %r", attempt + 1, exc)
 
+    msg = f"Error: could not reach the model service ({last_exc.__class__.__name__})."
+    yield f"data: {json.dumps(msg)}\n\n"
     yield "data: [DONE]\n\n"
